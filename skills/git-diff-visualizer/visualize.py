@@ -438,15 +438,22 @@ def render_summary(analysis):
     return f'<div class="summary"><p>{html.escape(summary)}</p></div>'
 
 
-def render_commit_box(analysis):
+def render_commit_box(analysis, staged):
     """Render the commit box: editable subject/body + clipboard buttons."""
     subject = (analysis or {}).get("commit_subject", "") if analysis else ""
     body = (analysis or {}).get("commit_body", "") if analysis else ""
     placeholder_subject = "feat: ..." if not subject else ""
     placeholder_body = "可选：详细说明（保留空行分段）" if not body else ""
+    scope_hint = (
+        '（工作区模式：命令会自动前置 <code>git add -A</code>）'
+        if not staged else
+        '（暂存模式：仅提交已暂存内容）'
+    )
     return (
-        '<section class="commit-box">'
-        '<h2>提交</h2>'
+        f'<section class="commit-box" data-staged="{"true" if staged else "false"}">'
+        '<h2>提交 '
+        f'<span class="commit-scope-hint">{scope_hint}</span>'
+        '</h2>'
         '<div class="commit-fields">'
         '<label class="commit-label">Subject'
         f'<input type="text" id="commit-subject" value="{html.escape(subject)}"'
@@ -578,6 +585,8 @@ h2 { border-bottom: 1px solid #e1e4e8; padding-bottom: 0.3em; margin-top: 2em; f
 .commit-box { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px;
               padding: 1em 1.2em; margin: 1.5em 0; }
 .commit-box h2 { margin-top: 0; border-bottom: none; padding-bottom: 0; }
+.commit-scope-hint { font-size: 0.7em; color: #586069; font-weight: 400; margin-left: 0.4em; }
+.commit-scope-hint code { background: #eaeef2; padding: 0.05em 0.35em; }
 .commit-fields { display: flex; flex-direction: column; gap: 0.6em; margin-bottom: 0.8em; }
 .commit-label { display: flex; flex-direction: column; font-size: 0.85em; color: #586069;
                 font-weight: 600; gap: 0.3em; }
@@ -656,13 +665,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   // Commit box: build git commit command from current subject/body, copy to clipboard.
   (function () {{
+    var commitBox = document.querySelector('.commit-box');
     var subjectEl = document.getElementById('commit-subject');
     var bodyEl = document.getElementById('commit-body');
     var btnCommit = document.getElementById('btn-commit');
     var btnPush = document.getElementById('btn-commit-push');
     var feedback = document.getElementById('copy-feedback');
     var previewEl = document.getElementById('commit-preview-text');
-    if (!subjectEl || !btnCommit || !btnPush) return;
+    if (!commitBox || !subjectEl || !btnCommit || !btnPush) return;
+    // Workspace mode (no staged content) needs `git add -A` first.
+    var needsAdd = commitBox.dataset.staged === 'false';
 
     function shellEscape(s) {{
       // Wrap content in double quotes safely: escape \\ " $ `
@@ -678,7 +690,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (!subject) return null;
       var msg = subject;
       if (body) msg += '\\n\\n' + body;
-      var cmd = 'git commit -m "' + shellEscape(msg) + '"';
+      var cmd = '';
+      if (needsAdd) cmd = 'git add -A && ';
+      cmd += 'git commit -m "' + shellEscape(msg) + '"';
       if (withPush) cmd += ' && git push';
       return cmd;
     }}
@@ -850,7 +864,7 @@ def main():
         scope_note=scope_note,
         validation_block=render_validation_errors(validation_errors),
         summary_block=render_summary(analysis),
-        commit_section=render_commit_box(analysis),
+        commit_section=render_commit_box(analysis, staged),
         file_rows=render_file_rows(rows_data, analysis),
         risks_section=render_risks(analysis),
     )
