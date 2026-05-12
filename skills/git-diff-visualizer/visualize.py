@@ -15,7 +15,10 @@ from pathlib import Path
 
 
 def run_git(args, check=True):
-    result = subprocess.run(["git"] + args, capture_output=True, text=True)
+    result = subprocess.run(
+        ["git"] + args, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
     if result.returncode != 0:
         if check:
             print(f"git {' '.join(args)} failed: {result.stderr}", file=sys.stderr)
@@ -57,6 +60,89 @@ def get_untracked(staged):
         return []
     out = run_git(["ls-files", "--others", "--exclude-standard"])
     return [f for f in out.strip().split("\n") if f]
+
+
+MAX_UNTRACKED_LINES = 500
+
+
+def read_untracked_file(path):
+    """Read an untracked file with line cap. Returns dict with binary detection."""
+    p = Path(path)
+    if not p.is_file():
+        return {"binary": False, "lines": [], "truncated": False, "total_lines": 0,
+                "error": "not a regular file"}
+    try:
+        with open(p, "rb") as f:
+            head = f.read(8192)
+    except OSError as e:
+        return {"binary": False, "lines": [], "truncated": False, "total_lines": 0,
+                "error": str(e)}
+    if b"\x00" in head:
+        return {"binary": True, "lines": [], "truncated": False, "total_lines": 0}
+
+    lines = []
+    truncated = False
+    total = 0
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                total += 1
+                if total <= MAX_UNTRACKED_LINES:
+                    lines.append(line.rstrip("\n").rstrip("\r"))
+                else:
+                    truncated = True
+    except OSError as e:
+        return {"binary": False, "lines": lines, "truncated": truncated, "total_lines": total,
+                "error": str(e)}
+    return {"binary": False, "lines": lines, "truncated": truncated, "total_lines": total}
+
+
+def get_untracked_with_content(staged):
+    """Workspace mode: read untracked file contents (with line cap). Empty in staged mode."""
+    if staged:
+        return []
+    return [{**read_untracked_file(p), "path": p} for p in get_untracked(staged)]
+
+
+def untracked_to_row(u):
+    """Convert an untracked file record to a row_data entry compatible with render_file_rows."""
+    if u.get("binary"):
+        return {
+            "path": u["path"],
+            "binary": True,
+            "added": 0,
+            "deleted": 0,
+            "diff_html": None,
+            "untracked": True,
+        }
+    lines = u.get("lines", [])
+    total = u.get("total_lines", len(lines))
+    truncated = u.get("truncated", False)
+    error = u.get("error")
+    lang = detect_language(u["path"])
+
+    if error:
+        header = f"@@ 新文件 · 读取失败：{error} @@"
+    elif truncated:
+        header = f"@@ 新文件 · 共 {total} 行 · 仅显示前 {MAX_UNTRACKED_LINES} 行 @@"
+    else:
+        header = f"@@ 新文件 · 共 {total} 行 @@"
+    parts = [f'<div class="hunk">{html.escape(header)}</div>']
+    for ln in lines:
+        parts.append(_render_code_line("+", ln, lang, "add"))
+    if truncated:
+        remaining = total - len(lines)
+        parts.append(
+            f'<div class="hunk">{html.escape(f"@@ …… 还有 {remaining} 行被截断 @@")}</div>'
+        )
+    return {
+        "path": u["path"],
+        "binary": False,
+        "added": len(lines),
+        "deleted": 0,
+        "diff_html": "\n".join(parts),
+        "untracked": True,
+    }
 
 
 def get_excluded_counts(staged):
@@ -314,10 +400,15 @@ def render_file_rows(rows_data, analysis):
         else:
             stats_html = '<span class="file-stats">binary</span>'
 
+        badge_html = ""
+        if row.get("untracked"):
+            badge_html = '<span class="badge new-file">新文件 · 未跟踪</span>'
+
         rows.append(
             f'<div class="file-row">'
             f'<div class="file-name">'
             f'<span class="file-path">{html.escape(path)}</span>'
+            f'{badge_html}'
             f'{stats_html}'
             f'</div>'
             f'<div class="file-content">'
@@ -419,6 +510,10 @@ h2 { border-bottom: 1px solid #e1e4e8; padding-bottom: 0.3em; margin-top: 2em; f
 .diff-placeholder { padding: 1em; color: #586069; font-style: italic; font-size: 0.9em; }
 
 .file-name .file-stats { font-weight: 400; font-size: 0.85em; margin-left: 0.6em; }
+.badge { display: inline-block; padding: 0.1em 0.5em; border-radius: 3px;
+         font-size: 0.72em; font-weight: 600; margin-left: 0.4em;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.badge.new-file { background: #dafbe1; color: #1a7f37; border: 1px solid #b6e3c1; }
 .intent-card { background: #fff; border: 1px solid #e1e4e8; border-radius: 4px;
                padding: 0.5em 0.8em; margin-bottom: 0.6em; }
 .intent-card:last-child { margin-bottom: 0; }
@@ -439,9 +534,6 @@ h2 { border-bottom: 1px solid #e1e4e8; padding-bottom: 0.3em; margin-top: 2em; f
 .risks { background: #fffbdd; padding: 0.8em 1.2em; border-radius: 6px;
          border-left: 4px solid #f9c513; }
 .risks ul { margin: 0; padding-left: 1.2em; }
-.untracked { background: #f6f8fa; padding: 0.8em 1.2em; border-radius: 6px; }
-.untracked ul { margin: 0; padding-left: 1.2em; }
-.untracked li { font-family: ui-monospace, monospace; font-size: 0.88em; }
 code { background: #f6f8fa; padding: 0.1em 0.4em; border-radius: 3px;
        font-family: ui-monospace, monospace; font-size: 0.9em; }
 """
@@ -480,8 +572,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </section>
 
 {risks_section}
-
-{untracked_section}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script>
@@ -535,11 +625,32 @@ def main():
 
     diff_text = get_diff(staged)
     stats = get_stats(staged)
-    untracked = get_untracked(staged)
+    untracked_data = get_untracked_with_content(staged)
     excluded = get_excluded_counts(staged)
     meta = get_meta()
 
-    print(f"[scope] mode={mode}, files={len(stats['files'])}", file=sys.stderr)
+    diff_files = parse_diff_by_file(diff_text)
+    diff_by_path = dict(diff_files)
+    rows_data = [
+        {
+            "path": f["path"],
+            "binary": f["binary"],
+            "added": f["added"],
+            "deleted": f["deleted"],
+            "diff_html": diff_by_path.get(f["path"]),
+            "untracked": False,
+        }
+        for f in stats["files"]
+    ]
+    rows_data.extend(untracked_to_row(u) for u in untracked_data)
+
+    file_count = len(rows_data)
+    total_added = sum(r["added"] for r in rows_data)
+    total_deleted = sum(r["deleted"] for r in rows_data)
+
+    print(f"[scope] mode={mode}, files={file_count}"
+          f" (tracked={len(stats['files'])}, untracked={len(untracked_data)})",
+          file=sys.stderr)
     if excluded:
         print(
             f"[scope] ignoring {excluded['unstaged_files']} unstaged file(s) "
@@ -553,7 +664,7 @@ def main():
         p = Path(args.analysis)
         if p.exists():
             analysis = json.loads(p.read_text(encoding="utf-8"))
-            scope_paths = {f["path"] for f in stats["files"]}
+            scope_paths = {r["path"] for r in rows_data}
             validation_errors = validate_analysis(analysis, scope_paths)
             if validation_errors:
                 print("[analysis] validation errors:", file=sys.stderr)
@@ -561,27 +672,6 @@ def main():
                     print(f"  - {e}", file=sys.stderr)
         else:
             print(f"warning: analysis file {p} not found, skipping", file=sys.stderr)
-
-    untracked_section = ""
-    if untracked:
-        items = "\n".join(f"<li>{html.escape(f)}</li>" for f in untracked)
-        untracked_section = (
-            f'<section><h2>未跟踪文件 ({len(untracked)})</h2>'
-            f'<div class="untracked"><ul>{items}</ul></div></section>'
-        )
-
-    diff_files = parse_diff_by_file(diff_text)
-    diff_by_path = dict(diff_files)
-    rows_data = [
-        {
-            "path": f["path"],
-            "binary": f["binary"],
-            "added": f["added"],
-            "deleted": f["deleted"],
-            "diff_html": diff_by_path.get(f["path"]),
-        }
-        for f in stats["files"]
-    ]
 
     scope_note = ""
     if excluded and (excluded["unstaged_files"] or excluded["untracked_files"]):
@@ -598,16 +688,15 @@ def main():
         head=html.escape(meta["head"]),
         mode=mode,
         generated_at=meta["generated_at"],
-        file_count=len(stats["files"]),
-        added=stats["added"],
-        deleted=stats["deleted"],
+        file_count=file_count,
+        added=total_added,
+        deleted=total_deleted,
         css=CSS,
         scope_note=scope_note,
         validation_block=render_validation_errors(validation_errors),
         summary_block=render_summary(analysis),
         file_rows=render_file_rows(rows_data, analysis),
         risks_section=render_risks(analysis),
-        untracked_section=untracked_section,
     )
 
     if args.output:
