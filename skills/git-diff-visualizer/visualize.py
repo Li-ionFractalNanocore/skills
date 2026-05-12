@@ -331,6 +331,13 @@ def validate_analysis(analysis, scope_paths):
                 if not isinstance(r, str):
                     errors.append(f"risks[{i}] 必须是字符串")
 
+    for key in ("commit_subject", "commit_body"):
+        if key in analysis and not isinstance(analysis[key], str):
+            errors.append(f"`{key}` 必须是字符串")
+    if isinstance(analysis.get("commit_subject"), str):
+        if "\n" in analysis["commit_subject"]:
+            errors.append("`commit_subject` 不能包含换行（subject 应保持单行）")
+
     return errors
 
 
@@ -429,6 +436,35 @@ def render_summary(analysis):
     if not summary:
         return ""
     return f'<div class="summary"><p>{html.escape(summary)}</p></div>'
+
+
+def render_commit_box(analysis):
+    """Render the commit box: editable subject/body + clipboard buttons."""
+    subject = (analysis or {}).get("commit_subject", "") if analysis else ""
+    body = (analysis or {}).get("commit_body", "") if analysis else ""
+    placeholder_subject = "feat: ..." if not subject else ""
+    placeholder_body = "可选：详细说明（保留空行分段）" if not body else ""
+    return (
+        '<section class="commit-box">'
+        '<h2>提交</h2>'
+        '<div class="commit-fields">'
+        '<label class="commit-label">Subject'
+        f'<input type="text" id="commit-subject" value="{html.escape(subject)}"'
+        f' placeholder="{html.escape(placeholder_subject)}" spellcheck="false"></label>'
+        '<label class="commit-label">Body'
+        f'<textarea id="commit-body" rows="4"'
+        f' placeholder="{html.escape(placeholder_body)}" spellcheck="false">{html.escape(body)}</textarea>'
+        '</label>'
+        '</div>'
+        '<div class="commit-actions">'
+        '<button type="button" id="btn-commit">复制 commit 命令</button>'
+        '<button type="button" id="btn-commit-push">复制 commit &amp; push 命令</button>'
+        '<span id="copy-feedback" class="copy-feedback" aria-live="polite"></span>'
+        '</div>'
+        '<details class="commit-preview"><summary>预览命令</summary>'
+        '<pre id="commit-preview-text"></pre></details>'
+        '</section>'
+    )
 
 
 def render_risks(analysis):
@@ -534,6 +570,37 @@ h2 { border-bottom: 1px solid #e1e4e8; padding-bottom: 0.3em; margin-top: 2em; f
 .risks { background: #fffbdd; padding: 0.8em 1.2em; border-radius: 6px;
          border-left: 4px solid #f9c513; }
 .risks ul { margin: 0; padding-left: 1.2em; }
+
+.commit-box { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px;
+              padding: 1em 1.2em; margin: 1.5em 0; }
+.commit-box h2 { margin-top: 0; border-bottom: none; padding-bottom: 0; }
+.commit-fields { display: flex; flex-direction: column; gap: 0.6em; margin-bottom: 0.8em; }
+.commit-label { display: flex; flex-direction: column; font-size: 0.85em; color: #586069;
+                font-weight: 600; gap: 0.3em; }
+.commit-label input, .commit-label textarea {
+  font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 0.9em;
+  padding: 0.5em 0.7em; border: 1px solid #d0d7de; border-radius: 4px;
+  background: #fff; color: #24292e; resize: vertical;
+}
+.commit-label input:focus, .commit-label textarea:focus {
+  outline: none; border-color: #0366d6; box-shadow: 0 0 0 2px rgba(3,102,214,0.2);
+}
+.commit-actions { display: flex; gap: 0.6em; align-items: center; flex-wrap: wrap; }
+.commit-actions button { padding: 0.45em 1em; border: 1px solid #d0d7de; border-radius: 4px;
+                          background: #fff; color: #0366d6; cursor: pointer;
+                          font: inherit; font-size: 0.88em; font-weight: 600; }
+.commit-actions button:hover { background: #ddf4ff; }
+.commit-actions button:disabled { color: #8c959f; cursor: not-allowed; background: #f6f8fa; }
+.commit-actions #btn-commit-push { background: #2da44e; color: #fff; border-color: #2c974b; }
+.commit-actions #btn-commit-push:hover { background: #2c974b; }
+.copy-feedback { font-size: 0.85em; color: #1a7f37; min-height: 1.2em; }
+.copy-feedback.error { color: #d73a49; }
+.commit-preview { margin-top: 0.8em; font-size: 0.85em; }
+.commit-preview summary { cursor: pointer; color: #0366d6; }
+.commit-preview pre { background: #fff; border: 1px solid #d0d7de; border-radius: 4px;
+                       padding: 0.6em 0.8em; margin-top: 0.4em; font-size: 0.85em;
+                       font-family: ui-monospace, monospace; white-space: pre-wrap;
+                       word-break: break-all; }
 code { background: #f6f8fa; padding: 0.1em 0.4em; border-radius: 3px;
        font-family: ui-monospace, monospace; font-size: 0.9em; }
 """
@@ -566,6 +633,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 {summary_block}
 
+{commit_section}
+
 <section>
 <h2>改动 · 意义</h2>
 {file_rows}
@@ -580,6 +649,83 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       try {{ hljs.highlightElement(el); }} catch (e) {{ /* ignore */ }}
     }});
   }}
+
+  // Commit box: build git commit command from current subject/body, copy to clipboard.
+  (function () {{
+    var subjectEl = document.getElementById('commit-subject');
+    var bodyEl = document.getElementById('commit-body');
+    var btnCommit = document.getElementById('btn-commit');
+    var btnPush = document.getElementById('btn-commit-push');
+    var feedback = document.getElementById('copy-feedback');
+    var previewEl = document.getElementById('commit-preview-text');
+    if (!subjectEl || !btnCommit || !btnPush) return;
+
+    function shellEscape(s) {{
+      // Wrap content in double quotes safely: escape \\ " $ `
+      return s.replace(/\\\\/g, '\\\\\\\\')
+              .replace(/"/g, '\\\\"')
+              .replace(/\\$/g, '\\\\$')
+              .replace(/`/g, '\\\\`');
+    }}
+
+    function buildCommand(withPush) {{
+      var subject = (subjectEl.value || '').trim();
+      var body = (bodyEl.value || '').replace(/\\r\\n/g, '\\n').replace(/\\s+$/, '');
+      if (!subject) return null;
+      var msg = subject;
+      if (body) msg += '\\n\\n' + body;
+      var cmd = 'git commit -m "' + shellEscape(msg) + '"';
+      if (withPush) cmd += ' && git push';
+      return cmd;
+    }}
+
+    function updatePreview() {{
+      var cmd = buildCommand(false);
+      previewEl.textContent = cmd || '(请填写 subject)';
+      var has = !!cmd;
+      btnCommit.disabled = !has;
+      btnPush.disabled = !has;
+    }}
+
+    function showFeedback(msg, isError) {{
+      feedback.textContent = msg;
+      feedback.classList.toggle('error', !!isError);
+      clearTimeout(feedback._t);
+      feedback._t = setTimeout(function () {{ feedback.textContent = ''; }}, 2500);
+    }}
+
+    function copy(text) {{
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        return navigator.clipboard.writeText(text);
+      }}
+      // Fallback for non-secure contexts (file://)
+      return new Promise(function (resolve, reject) {{
+        try {{
+          var ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.select();
+          var ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          ok ? resolve() : reject(new Error('execCommand failed'));
+        }} catch (e) {{ reject(e); }}
+      }});
+    }}
+
+    function onClick(withPush) {{
+      var cmd = buildCommand(withPush);
+      if (!cmd) {{ showFeedback('请先填写 subject', true); return; }}
+      copy(cmd).then(
+        function () {{ showFeedback('✓ 已复制：' + (withPush ? 'commit & push' : 'commit') + ' 命令'); }},
+        function (e) {{ showFeedback('复制失败：' + e.message, true); }}
+      );
+    }}
+
+    btnCommit.addEventListener('click', function () {{ onClick(false); }});
+    btnPush.addEventListener('click', function () {{ onClick(true); }});
+    subjectEl.addEventListener('input', updatePreview);
+    bodyEl.addEventListener('input', updatePreview);
+    updatePreview();
+  }})();
 
   // Foldable diff: cap diff-col height to analysis-col height
   document.querySelectorAll('.file-row').forEach(function (row) {{
@@ -695,6 +841,7 @@ def main():
         scope_note=scope_note,
         validation_block=render_validation_errors(validation_errors),
         summary_block=render_summary(analysis),
+        commit_section=render_commit_box(analysis),
         file_rows=render_file_rows(rows_data, analysis),
         risks_section=render_risks(analysis),
     )

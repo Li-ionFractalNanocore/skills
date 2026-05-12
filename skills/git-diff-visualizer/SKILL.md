@@ -67,6 +67,8 @@ git diff            # 无暂存
 {
   "title": "用作页面标题的短标题，10-25 字，能让人一眼知道这次改动在做什么",
   "summary": "一两句话概括这次改动整体在做什么，作为正文导语",
+  "commit_subject": "可选：conventional commit 风格的单行 subject，例如 'feat(auth): add OAuth login'",
+  "commit_body": "可选：commit message 正文。可多段（用空行分隔），描述动机/影响/注意事项。",
   "intents": [
     {
       "title": "意图标题，动词开头，例如：添加 XX 功能 / 重构 YY / 修复 ZZ bug",
@@ -92,6 +94,9 @@ git diff            # 无暂存
 - `details` 每个意图 **2-5 条**，**每条 1-3 句**——比纯短语要充实，能让读者光看右栏就能理解这块改动；遇到长函数 / 复杂逻辑就写得更具体（提函数名、关键参数、行为变化）。
 - `deep` 可选。**当改动复杂或代码较长时强烈建议填**。这里放设计权衡、下游影响、扩展性考虑等较长的内容，默认折叠不打扰扫读。
 - `risks` 可选；没有就省略字段或给空数组。**只列真正值得用户二次确认的东西**——不要凑数。
+- `commit_subject` / `commit_body` 可选但**强烈建议填**：HTML 顶部会渲染一个可编辑的提交面板和两个按钮（"复制 commit"、"复制 commit & push"），点击把对应 `git commit -m "..."` 命令复制到剪贴板。
+  - `commit_subject` 单行（禁止换行，**有换行会触发校验失败**），≤72 字，conventional commit 风格（`type(scope): summary`）。
+  - `commit_body` 可选多段，用空行分隔段落；描述动机、影响、需要 reviewer 注意的点。可以省略。
 
 ### 渲染规则（影响你怎么组织 intents）
 
