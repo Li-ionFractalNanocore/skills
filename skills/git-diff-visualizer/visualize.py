@@ -274,7 +274,8 @@ def validate_analysis(analysis, scope_paths):
     if not isinstance(analysis, dict):
         return ["analysis 顶层必须是 JSON 对象"]
 
-    required = {"title": str, "summary": str, "intents": list}
+    required = {"title": str, "summary": str, "intents": list,
+                "commit_subject": str, "commit_body": str}
     for field, exp in required.items():
         if field not in analysis:
             errors.append(f"缺少必填字段 `{field}`")
@@ -331,12 +332,11 @@ def validate_analysis(analysis, scope_paths):
                 if not isinstance(r, str):
                     errors.append(f"risks[{i}] 必须是字符串")
 
-    for key in ("commit_subject", "commit_body"):
-        if key in analysis and not isinstance(analysis[key], str):
-            errors.append(f"`{key}` 必须是字符串")
     if isinstance(analysis.get("commit_subject"), str):
         if "\n" in analysis["commit_subject"]:
             errors.append("`commit_subject` 不能包含换行（subject 应保持单行）")
+        if not analysis["commit_subject"].strip():
+            errors.append("`commit_subject` 不能为空字符串")
 
     return errors
 
@@ -522,10 +522,14 @@ h2 { border-bottom: 1px solid #e1e4e8; padding-bottom: 0.3em; margin-top: 2em; f
   pointer-events: none;
 }
 .analysis-col { padding: 0.8em 1em; background: #fafbfc; min-width: 0; }
-.diff-toggle { margin-left: auto; padding: 0.2em 0.6em; border: 1px solid #d0d7de;
-               background: #fff; color: #0366d6; cursor: pointer; border-radius: 4px;
-               font-size: 0.85em; font-family: inherit; }
-.diff-toggle:hover { background: #f6f8fa; }
+.diff-toggle { position: absolute; left: 50%; bottom: 0.5em;
+               transform: translateX(-50%); z-index: 2;
+               padding: 0.25em 0.9em; border: 1px solid #d0d7de;
+               background: #fff; color: #0366d6; cursor: pointer; border-radius: 999px;
+               font-size: 0.82em; font-family: inherit;
+               box-shadow: 0 1px 4px rgba(0,0,0,0.12); }
+.diff-toggle:hover { background: #f6f8fa; border-color: #0366d6; }
+.diff-col.expanded { padding-bottom: 2.6em; }
 @media (max-width: 1000px) {
   .file-content { grid-template-columns: 1fr; }
   .diff-col { border-right: 0; border-bottom: 1px solid #e1e4e8; }
@@ -731,8 +735,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   document.querySelectorAll('.file-row').forEach(function (row) {{
     var analysisCol = row.querySelector('.analysis-col');
     var diffCol = row.querySelector('.diff-col');
-    var fileName = row.querySelector('.file-name');
-    if (!analysisCol || !diffCol || !fileName) return;
+    if (!analysisCol || !diffCol) return;
 
     var target = analysisCol.offsetHeight;
     if (target <= 0) return;
@@ -743,15 +746,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     diffCol.classList.add('clipped');
     var btn = document.createElement('button');
     btn.className = 'diff-toggle';
+    btn.type = 'button';
     btn.textContent = '展开代码 ▾';
     btn.setAttribute('aria-expanded', 'false');
-    fileName.appendChild(btn);
+    diffCol.appendChild(btn);
 
     btn.addEventListener('click', function () {{
       var expanded = diffCol.classList.toggle('expanded');
       diffCol.style.maxHeight = expanded ? 'none' : (target + 'px');
       btn.textContent = expanded ? '收起代码 ▴' : '展开代码 ▾';
       btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      if (expanded) {{
+        // After expand the button stays absolute at diff-col bottom — scroll
+        // it into view so the user can confirm position changed.
+        btn.scrollIntoView({{ block: 'nearest', behavior: 'smooth' }});
+      }}
     }});
   }});
 </script>
