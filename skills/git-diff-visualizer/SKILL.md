@@ -1,6 +1,6 @@
 ---
 name: git-diff-visualizer
-description: Generate an HTML visualization report for the current uncommitted git changes, using AI intent analysis. If staged changes exist, inspect the staging area first; otherwise inspect the working tree. Output the report to the project's tmp/ directory. Use this when the user wants to review their own changes, understand the "meaning" of a change, generate a visual explanation of changes, self-review code before committing, or explicitly says "visualize git diff / draw out the changes / explain this change".
+description: Generate an HTML visualization report for the current uncommitted git changes, using AI intent analysis. If staged changes exist, inspect the staging area first; otherwise inspect the working tree. By default, use the local review-server gate so the user can review the report in a browser and send structured feedback back to the agent. Fall back to static file:// HTML only when the review server cannot run, localhost/browser access is unavailable, or the user explicitly asks for a static report. Use this when the user wants to review their own changes, understand the "meaning" of a change, generate a visual explanation of changes, self-review code before committing, prepare for a commit, or explicitly says "visualize git diff / draw out the changes / explain this change".
 ---
 
 # Git Diff Visualizer
@@ -12,6 +12,7 @@ Generate an HTML report that answers the user's core question: **"What does this
 - **The script** (`visualize.py`) handles all deterministic work: extracting the diff, computing statistics, and rendering the HTML skeleton. It is language-agnostic and will not break just because it encounters an unfamiliar programming language.
 - **You (Claude)** handle semantic analysis: read the diff, group changes by "intent", identify risks, and output structured JSON. The script injects that JSON into the HTML template.
 - If AI analysis fails or is skipped, the script can still produce a fallback HTML report with "diff only, no meaning explanation".
+- By default, start a temporary `127.0.0.1` review server. The page sends `submit`, `submit_push`, `request_changes`, or `cancel` back to the agent process, but the page never runs `git commit`; the agent decides what command to run after reading the returned JSON.
 
 ## Scope Rules (the most important section; read carefully)
 
@@ -32,6 +33,16 @@ The script only inspects one scope, **depending on whether staged changes exist*
 The script prints the current scope to stderr and shows "ignored X unstaged / Y untracked" in the HTML header; use this as a second check.
 
 ## Workflow
+
+### Step 0 - Choose the Run Mode
+
+Use this decision first, before generating the HTML:
+
+- Default: **run review-server mode** in Step 4. Do not run static `file://` mode first.
+- Fall back to static HTML mode in Step 5 only when review-server mode cannot run, localhost/browser access is unavailable, the command environment cannot keep a foreground blocking process open, or the user explicitly asks for a static report.
+- If review-server mode fails to start because local port binding or localhost access is unavailable: tell the user it failed, then fall back to static HTML mode.
+
+Commit requests must not proceed directly to `git commit`. The review-server result is the approval gate when a commit may follow.
 
 ### Step 1 - Determine the Scope
 
@@ -94,7 +105,7 @@ Field constraints:
 - `details` must contain **2-5 items** per intent, with **1-3 sentences per item**. Each item should be more substantial than a short phrase, so the reader can understand this part of the change from the right column alone. For long functions or complex logic, be more specific by naming functions, key parameters, and behavior changes.
 - `deep` is optional. **Strongly prefer filling it in when the change is complex or the code is long**. Put longer content here, such as design tradeoffs, downstream impact, and extensibility considerations. It is collapsed by default so it does not disturb scanning.
 - `risks` is optional. If there are no risks, omit the field or use an empty array. **Only list things genuinely worth a second confirmation from the user**; do not pad the list.
-- `commit_subject` / `commit_body` are **required**: the top of the HTML renders an editable commit panel and two buttons ("copy commit", "copy commit & push"). Clicking them copies the corresponding `git commit -m "..."` command to the clipboard.
+- `commit_subject` / `commit_body` are **required**: the top of the HTML renders an editable commit panel. In static `file://` mode it shows copy buttons ("copy commit", "copy commit & push"); in review-gate mode it shows action buttons ("提交", "提交&同步", "需要修改", "取消提交").
   - In **working-tree mode** (no staged changes), the copied command is **automatically prefixed with `git add -A &&`**, staging all changes and untracked files before committing, matching the scope shown by the HTML. In **staging-area mode**, no `add` is included; it only commits already staged content.
   - `commit_subject` is required, single-line, non-empty (no newlines, not all whitespace; **violations trigger validation failure**), <=72 characters, and in conventional commit style (`type(scope): summary`).
   - `commit_body` is a required string. It may contain multiple paragraphs separated by blank lines, describing motivation, impact, and points reviewers should pay attention to. **The field must exist**, but it may be the empty string `""` (only when the change is extremely simple and the subject says enough).
@@ -118,26 +129,50 @@ Field constraints:
 - These file paths automatically enter the scope. **When writing `intent.files`, reference them just like ordinary changed files.**
 - In staging-area mode, untracked files are still ignored; the scope rule does not change.
 
-### Step 4 - Generate HTML
+### Step 4 - Commit Review Gate
 
 ```bash
-python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.json
+python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.json --review-server
 ```
 
-The script prints the final HTML URL to stdout as a browser-openable `file://...` URL (default target file: `<repo>/tmp/git-diff.html`). Use that exact URL in the final response.
+Use this mode by default for every run.
 
 **If stderr contains `[analysis] validation errors:`**, the JSON does not conform to the schema (wrong type, missing field, `files` points to paths outside the current scope, etc.). A red banner at the top of the HTML will list all problems. **Fix the JSON and rerun the script**; do not deliver HTML with validation errors to the user. Common pitfalls:
 - `files` is written as a string instead of an array
 - `details` is written as a string instead of an array
 - A path in `files` does not exist in the current scope (typo or drifted out of scope)
 
-### Step 5 - Tell the User
+Behavior:
 
-Tell the user the `file://...` output URL in one sentence, so it can be opened directly in a browser. Do not replace it with a plain filesystem path, and do not repeat content already written in the HTML.
+- Review-server mode is intentionally foreground/blocking. Do not wait for the command to exit before showing the URL.
+- Start it as a long-running command. Read the first stdout line, which is prefixed as `[review-url] http://127.0.0.1:<port>/?token=...`, send that URL to the user, and keep the process/session open.
+- The script still writes `<repo>/tmp/git-diff.html`, but the review-gate URL is the `http://127.0.0.1` URL printed after `[review-url]`.
+- Give the user that `http://127.0.0.1` URL and wait; do not commit yet.
+- The page's review buttons POST one structured decision back to the local server: `submit`, `submit_push`, `request_changes`, or `cancel`.
+- The script then prints a JSON object prefixed as `[review-result]` and exits, for example `[review-result] {"decision":"submit","notes":"","commit_subject":"...","commit_body":"..."}`.
+- If `decision` is `submit`, use the returned `commit_subject` and `commit_body` to commit the exact reviewed scope. In working-tree mode, stage the same scope first with `git add -A`; in staged mode, commit only what is already staged.
+- If `decision` is `submit_push`, commit as above, then ask for explicit confirmation before running `git push` unless the user already approved pushing in this same turn.
+- If `decision` is `request_changes`, use `notes` as the requested changes, edit the code, regenerate the report, and repeat review.
+- If `decision` is `cancel` or `timeout`, do not commit.
+- The review server listens only on `127.0.0.1`, requires a random token, accepts one review decision, and does not execute git commands.
+- If the review server cannot start or cannot be reached, fall back to the static `file://` report and the copy-command buttons.
+
+### Step 5 - Static HTML Fallback
+
+Use static mode only when review-server mode cannot run, localhost/browser access is unavailable, the command environment cannot keep a foreground blocking process open, or the user explicitly asked for a static report:
+
+```bash
+python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.json
+```
+
+The script prints the final HTML URL to stdout as a browser-openable `file://...` URL (default target file: `<repo>/tmp/git-diff.html`). Tell the user that URL in one sentence. Do not replace it with a plain filesystem path, and do not repeat content already written in the HTML.
 
 ## Command Reference
 
 ```bash
+# Default: serve the page locally and wait for submit/submit_push/request_changes/cancel
+python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.json --review-server
+
 # Run only the script, generating HTML without AI analysis (fallback usage)
 python skills/git-diff-visualizer/visualize.py
 
@@ -148,7 +183,7 @@ python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.
 python skills/git-diff-visualizer/visualize.py --output some/path.html
 ```
 
-All commands print a directly openable `file://...` URL to stdout.
+Static commands print a directly openable `file://...` URL to stdout and are fallback-only by default. `--review-server` is a foreground blocking command: it first prints `[review-url] http://127.0.0.1...`, then later prints `[review-result] {...}` after the user clicks a review button.
 
 ## Notes
 

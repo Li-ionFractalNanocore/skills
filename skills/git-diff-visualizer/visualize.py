@@ -8,11 +8,14 @@ import argparse
 import html
 import json
 import re
+import secrets
 import subprocess
 import sys
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from threading import Event, Thread
+from urllib.parse import parse_qs, quote, urlparse
 
 
 def run_git(args, check=True):
@@ -439,8 +442,8 @@ def render_summary(analysis):
     return f'<div class="summary"><p>{html.escape(summary)}</p></div>'
 
 
-def render_commit_box(analysis, staged):
-    """Render the commit box: editable subject/body + clipboard buttons."""
+def render_commit_box(analysis, staged, review_enabled=False, review_token=""):
+    """Render commit fields plus either clipboard buttons or review-gate buttons."""
     subject = (analysis or {}).get("commit_subject", "") if analysis else ""
     body = (analysis or {}).get("commit_body", "") if analysis else ""
     placeholder_subject = "feat: ..." if not subject else ""
@@ -464,13 +467,34 @@ def render_commit_box(analysis, staged):
         f' placeholder="{html.escape(placeholder_body)}" spellcheck="false">{html.escape(body)}</textarea>'
         '</label>'
         '</div>'
-        '<div class="commit-actions">'
-        '<button type="button" id="btn-commit">复制 commit 命令</button>'
-        '<button type="button" id="btn-commit-push">复制 commit &amp; push 命令</button>'
-        '<span id="copy-feedback" class="copy-feedback" aria-live="polite"></span>'
-        '</div>'
+        f'{render_commit_actions(review_enabled, review_token)}'
         '<details class="commit-preview"><summary>预览命令</summary>'
         '<pre id="commit-preview-text"></pre></details>'
+        '</section>'
+    )
+
+
+def render_commit_actions(review_enabled, token):
+    if not review_enabled:
+        return (
+            '<div class="commit-actions">'
+            '<button type="button" id="btn-commit">复制 commit 命令</button>'
+            '<button type="button" id="btn-commit-push">复制 commit &amp; push 命令</button>'
+            '<span id="copy-feedback" class="copy-feedback" aria-live="polite"></span>'
+            '</div>'
+        )
+    return (
+        f'<section class="review-box" data-review-token="{html.escape(token)}">'
+        '<label class="commit-label">反馈说明'
+        '<textarea id="review-notes" rows="3" placeholder="需要修改时写清楚要调整什么；审核通过可留空"></textarea>'
+        '</label>'
+        '<div class="review-actions">'
+        '<button type="button" id="btn-review-submit">提交</button>'
+        '<button type="button" id="btn-review-submit-push">提交&amp;同步</button>'
+        '<button type="button" id="btn-review-changes">需要修改</button>'
+        '<button type="button" id="btn-review-cancel">取消提交</button>'
+        '<span id="review-feedback" class="copy-feedback" aria-live="polite"></span>'
+        '</div>'
         '</section>'
     )
 
@@ -491,6 +515,83 @@ def page_title(analysis):
             s = analysis["summary"]
             return s if len(s) <= 40 else s[:40] + "…"
     return "Git 改动可视化"
+
+
+def path_to_file_url(path):
+    return "file://" + quote(str(Path(path).resolve()))
+
+
+def wait_for_review(html_out, token, port, timeout):
+    review = {}
+    done = Event()
+
+    class ReviewHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def _send(self, status, body, content_type="application/json"):
+            raw = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            if qs.get("token", [""])[0] != token:
+                self._send(403, json.dumps({"error": "bad token"}))
+                return
+            self._send(200, html_out, "text/html; charset=utf-8")
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            if parsed.path != "/review":
+                self._send(404, json.dumps({"error": "not found"}))
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 65536:
+                self._send(413, json.dumps({"error": "payload too large"}))
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send(400, json.dumps({"error": "invalid json"}))
+                return
+            if data.get("token") != token:
+                self._send(403, json.dumps({"error": "bad token"}))
+                return
+            if data.get("decision") not in {"submit", "submit_push", "request_changes", "cancel"}:
+                self._send(400, json.dumps({"error": "invalid decision"}))
+                return
+            review.update({
+                "decision": data["decision"],
+                "notes": str(data.get("notes") or ""),
+                "commit_subject": str(data.get("commit_subject") or ""),
+                "commit_body": str(data.get("commit_body") or ""),
+            })
+            self._send(200, json.dumps({"ok": True}))
+            done.set()
+
+    server = HTTPServer(("127.0.0.1", port), ReviewHandler)
+    actual_port = server.server_address[1]
+    review_url = f"http://127.0.0.1:{actual_port}/?token={token}"
+
+    def serve():
+        while not done.is_set():
+            server.handle_request()
+
+    thread = Thread(target=serve, daemon=True)
+    thread.start()
+    print(f"[review-url] {review_url}", flush=True)
+    if not done.wait(timeout):
+        server.server_close()
+        print(f"[review-result] {json.dumps({'decision': 'timeout'}, ensure_ascii=False)}")
+        return
+    server.server_close()
+    print(f"[review-result] {json.dumps(review, ensure_ascii=False)}")
 
 
 CSS = """
@@ -615,6 +716,21 @@ h2 { border-bottom: 1px solid #e1e4e8; padding-bottom: 0.3em; margin-top: 2em; f
                        padding: 0.6em 0.8em; margin-top: 0.4em; font-size: 0.85em;
                        font-family: ui-monospace, monospace; white-space: pre-wrap;
                        word-break: break-all; }
+.review-box { margin-top: 1em; padding-top: 1em; border-top: 1px solid #d0d7de; }
+.review-actions { display: flex; gap: 0.6em; align-items: center; flex-wrap: wrap; margin-top: 0.7em; }
+.review-actions button { padding: 0.45em 1em; border: 1px solid #d0d7de; border-radius: 4px;
+                         background: #fff; color: #0366d6; cursor: pointer;
+                         font: inherit; font-size: 0.88em; font-weight: 600; }
+.review-actions button:hover { background: #ddf4ff; }
+.review-actions button:disabled { color: #8c959f; cursor: not-allowed; background: #f6f8fa; }
+.review-actions #btn-review-submit,
+.review-actions #btn-review-submit-push { background: #2da44e; color: #fff; border-color: #2c974b; }
+.review-actions #btn-review-submit:hover,
+.review-actions #btn-review-submit-push:hover { background: #2c974b; }
+.review-actions #btn-review-changes { color: #9a6700; border-color: #d4a72c; }
+.review-actions #btn-review-changes:hover { background: #fff8c5; }
+.review-actions #btn-review-cancel { color: #cf222e; border-color: #ff8182; }
+.review-actions #btn-review-cancel:hover { background: #ffebe9; }
 code { background: #f6f8fa; padding: 0.1em 0.4em; border-radius: 3px;
        font-family: ui-monospace, monospace; font-size: 0.9em; }
 """
@@ -746,6 +862,66 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     updatePreview();
   }})();
 
+  // Review server mode: send one structured decision back to the local agent process.
+  (function () {{
+    var reviewBox = document.querySelector('.review-box');
+    if (!reviewBox) return;
+    var token = reviewBox.dataset.reviewToken || '';
+    var notesEl = document.getElementById('review-notes');
+    var subjectEl = document.getElementById('commit-subject');
+    var bodyEl = document.getElementById('commit-body');
+    var feedback = document.getElementById('review-feedback');
+    var buttons = [
+      document.getElementById('btn-review-submit'),
+      document.getElementById('btn-review-submit-push'),
+      document.getElementById('btn-review-changes'),
+      document.getElementById('btn-review-cancel')
+    ].filter(Boolean);
+
+    function showReviewFeedback(msg, isError) {{
+      feedback.textContent = msg;
+      feedback.classList.toggle('error', !!isError);
+    }}
+
+    function setBusy(busy) {{
+      buttons.forEach(function (btn) {{ btn.disabled = busy; }});
+    }}
+
+    function submitReview(decision) {{
+      var payload = {{
+        token: token,
+        decision: decision,
+        notes: notesEl ? notesEl.value : '',
+        commit_subject: subjectEl ? subjectEl.value.trim() : '',
+        commit_body: bodyEl ? bodyEl.value.replace(/\\r\\n/g, '\\n').replace(/\\s+$/, '') : ''
+      }};
+      setBusy(true);
+      showReviewFeedback('正在发送审核结果...', false);
+      fetch('/review', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload)
+      }}).then(function (res) {{
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      }}).then(function () {{
+        showReviewFeedback('已发送，agent 将继续处理。', false);
+      }}).catch(function (e) {{
+        setBusy(false);
+        showReviewFeedback('发送失败：' + e.message, true);
+      }});
+    }}
+
+    var submit = document.getElementById('btn-review-submit');
+    var submitPush = document.getElementById('btn-review-submit-push');
+    var changes = document.getElementById('btn-review-changes');
+    var cancel = document.getElementById('btn-review-cancel');
+    if (submit) submit.addEventListener('click', function () {{ submitReview('submit'); }});
+    if (submitPush) submitPush.addEventListener('click', function () {{ submitReview('submit_push'); }});
+    if (changes) changes.addEventListener('click', function () {{ submitReview('request_changes'); }});
+    if (cancel) cancel.addEventListener('click', function () {{ submitReview('cancel'); }});
+  }})();
+
   // Foldable diff: cap diff-col height to analysis-col height
   document.querySelectorAll('.file-row').forEach(function (row) {{
     var analysisCol = row.querySelector('.analysis-col');
@@ -788,6 +964,12 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize uncommitted git changes as HTML.")
     parser.add_argument("--analysis", help="Path to analysis JSON file (optional).")
     parser.add_argument("--output", help="Output HTML path. Default: <repo>/tmp/git-diff.html")
+    parser.add_argument("--review-server", action="store_true",
+                        help="Serve the report on 127.0.0.1 and wait for one review decision.")
+    parser.add_argument("--review-port", type=int, default=0,
+                        help="Port for --review-server. Default 0 chooses a free port.")
+    parser.add_argument("--review-timeout", type=int, default=1800,
+                        help="Seconds to wait for review feedback. Default 1800.")
     args = parser.parse_args()
 
     staged = has_staged()
@@ -852,6 +1034,7 @@ def main():
             f'分析与左侧 diff 都不包含它们。</div>'
         )
 
+    review_token = secrets.token_urlsafe(24) if args.review_server else ""
     html_out = HTML_TEMPLATE.format(
         title=html.escape(page_title(analysis)),
         branch=html.escape(meta["branch"]),
@@ -865,7 +1048,7 @@ def main():
         scope_note=scope_note,
         validation_block=render_validation_errors(validation_errors),
         summary_block=render_summary(analysis),
-        commit_section=render_commit_box(analysis, staged),
+        commit_section=render_commit_box(analysis, staged, args.review_server, review_token),
         file_rows=render_file_rows(rows_data, analysis),
         risks_section=render_risks(analysis),
     )
@@ -877,8 +1060,10 @@ def main():
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_out, encoding="utf-8")
-    output_url = "file://" + quote(str(output_path.resolve()))
-    print(output_url)
+    if args.review_server:
+        wait_for_review(html_out, review_token, args.review_port, args.review_timeout)
+    else:
+        print(path_to_file_url(output_path))
 
 
 if __name__ == "__main__":
