@@ -124,7 +124,7 @@ Field constraints:
 python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.json
 ```
 
-The script prints the final HTML path to stdout (default: `<repo>/tmp/git-diff.html`).
+The script prints the final HTML URL to stdout as a browser-openable `file://...` URL (default target file: `<repo>/tmp/git-diff.html`). Use that exact URL in the final response.
 
 **If stderr contains `[analysis] validation errors:`**, the JSON does not conform to the schema (wrong type, missing field, `files` points to paths outside the current scope, etc.). A red banner at the top of the HTML will list all problems. **Fix the JSON and rerun the script**; do not deliver HTML with validation errors to the user. Common pitfalls:
 - `files` is written as a string instead of an array
@@ -133,7 +133,7 @@ The script prints the final HTML path to stdout (default: `<repo>/tmp/git-diff.h
 
 ### Step 5 - Tell the User
 
-Tell the user the output path in one sentence. Do not repeat content already written in the HTML.
+Tell the user the `file://...` output URL in one sentence, so it can be opened directly in a browser. Do not replace it with a plain filesystem path, and do not repeat content already written in the HTML.
 
 ## Command Reference
 
@@ -148,9 +148,12 @@ python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.
 python skills/git-diff-visualizer/visualize.py --output some/path.html
 ```
 
+All commands print a directly openable `file://...` URL to stdout.
+
 ## Notes
 
 - The HTML file has a fixed name: `tmp/git-diff.html`. It is overwritten every time. History is not preserved.
 - The script automatically runs the equivalent of `mkdir -p tmp/`.
 - The project root is determined by `git rev-parse --show-toplevel`, so running from any subdirectory is fine.
+- Paths with spaces or non-ASCII characters are URL-escaped in the printed `file://...` URL.
 - Binary file / large file changes: the script does not add special handling, but git diff itself skips binary content, so the behavior is normal.

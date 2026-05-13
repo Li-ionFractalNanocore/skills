@@ -12,6 +12,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 
 def run_git(args, check=True):
@@ -876,7 +877,8 @@ def main():
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_out, encoding="utf-8")
-    print(str(output_path))
+    output_url = "file://" + quote(str(output_path.resolve()))
+    print(output_url)
 
 
 if __name__ == "__main__":
