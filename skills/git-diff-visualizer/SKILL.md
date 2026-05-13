@@ -1,156 +1,156 @@
 ---
 name: git-diff-visualizer
-description: 将当前 git 未提交代码（有暂存内容时优先看暂存区，否则看工作区）通过 AI 意图分析生成 HTML 可视化报告，输出到项目 tmp/ 目录。当用户想 review 自己的修改、理解一段改动的"意义"、生成可视化的改动说明、自审提交前的代码、或者明确说"可视化 git diff / 把改动画出来 / 解释这段改动"时使用。
+description: Generate an HTML visualization report for the current uncommitted git changes, using AI intent analysis. If staged changes exist, inspect the staging area first; otherwise inspect the working tree. Output the report to the project's tmp/ directory. Use this when the user wants to review their own changes, understand the "meaning" of a change, generate a visual explanation of changes, self-review code before committing, or explicitly says "visualize git diff / draw out the changes / explain this change".
 ---
 
 # Git Diff Visualizer
 
-生成一份 HTML 报告，回答用户的核心问题：**"这次改动在做什么？"**
+Generate an HTML report that answers the user's core question: **"What does this change do?"**
 
-## 设计
+## Design
 
-- **脚本** (`visualize.py`) 负责所有确定性工作：提取 diff、计算统计、渲染 HTML 骨架。与代码语言无关，不会因为遇到没见过的语言挂掉。
-- **你（Claude）** 负责语义分析：读 diff，按"意图"分组，识别风险，输出结构化 JSON。脚本把 JSON 注入到 HTML 模板里。
-- AI 分析失败或跳过也能产出一份"只有 diff 没有意义说明"的 HTML，作为降级。
+- **The script** (`visualize.py`) handles all deterministic work: extracting the diff, computing statistics, and rendering the HTML skeleton. It is language-agnostic and will not break just because it encounters an unfamiliar programming language.
+- **You (Claude)** handle semantic analysis: read the diff, group changes by "intent", identify risks, and output structured JSON. The script injects that JSON into the HTML template.
+- If AI analysis fails or is skipped, the script can still produce a fallback HTML report with "diff only, no meaning explanation".
 
-## ⚠️ 作用域规则（最重要的一条，必读）
+## Scope Rules (the most important section; read carefully)
 
-脚本只看一个范围，**取决于是否有暂存内容**：
+The script only inspects one scope, **depending on whether staged changes exist**:
 
-| 仓库状态 | 作用域 | 看什么 | 不看什么 |
+| Repository state | Scope | What to inspect | What not to inspect |
 |---------|--------|--------|---------|
-| 有暂存内容 | **只看暂存区** | `git diff --cached` | 未暂存的修改、未跟踪文件——全部忽略 |
-| 无暂存内容 | **看整个工作区** | `git diff` + 未跟踪文件（作为新文件渲染） | （没有要排除的） |
+| Staged changes exist | **Only inspect the staging area** | `git diff --cached` | Unstaged changes and untracked files; ignore all of them |
+| No staged changes | **Inspect the whole working tree** | `git diff` + untracked files, rendered as new files | Nothing excluded |
 
-**你的 analysis JSON 必须严格落在这个作用域内**：
+**Your analysis JSON must strictly stay within this scope**:
 
-- 描述的所有修改必须来自上面那条 diff 命令的输出。
-- **即使你之前 Read 过文件、最近编辑过、或者从上下文知道文件还有其它修改，写 analysis 时也只能描述当前作用域里能看到的内容。**
-- 文件 `AM`（既暂存又有未暂存修改）的情况尤其要警惕：暂存里只有一部分，工作区有另一部分，你只能描述"暂存"那一部分，**不能描述未暂存的功能**，否则左右两栏会对不上。
-- 写分析前先在心里确认一次："如果只看 `git diff --cached` 的输出，我要写的这条 detail 还成立吗？" 如果不成立，删掉。
+- Every change you describe must come from the output of the diff command above.
+- **Even if you previously read a file, recently edited it, or know from context that the file has other changes, the analysis may only describe content visible in the current scope.**
+- Be especially careful with `AM` files, which have both staged and unstaged changes: only part of the file is staged, while another part remains in the working tree. You may only describe the "staged" part, and **must not describe unstaged functionality**, or the left and right columns will not match.
+- Before writing the analysis, mentally confirm: "If I only look at the output of `git diff --cached`, is this detail still true?" If not, delete it.
 
-脚本会在 stderr 打印当前作用域，并在 HTML 头部展示"忽略了 X 个未暂存 / Y 个未跟踪"——可以用它做二次校验。
+The script prints the current scope to stderr and shows "ignored X unstaged / Y untracked" in the HTML header; use this as a second check.
 
-## 工作流
+## Workflow
 
-### Step 1 — 确定作用域
+### Step 1 - Determine the Scope
 
 ```bash
 git status --short
 ```
 
-读输出第一列（暂存）和第二列（工作区）：
+Read the first column (staging area) and second column (working tree) of the output:
 
-- **任一行第一列不是空格** → 有暂存内容 → 作用域 = 暂存区
-- **所有行第一列都是空格**（或 `??` 未跟踪） → 无暂存内容 → 作用域 = 工作区
-- 完全没改动也没未跟踪 → 直接告诉用户没东西可看，停止
+- **If the first column of any line is not a space** -> staged changes exist -> scope = staging area
+- **If the first column of every line is a space** (or `??` untracked) -> no staged changes -> scope = working tree
+- If there are no changes and no untracked files at all -> tell the user there is nothing to inspect and stop
 
-**口头确认一次作用域**，例如："检测到 2 个暂存文件，本次分析只覆盖暂存区，会忽略未暂存修改和未跟踪文件。" 这一句是给你自己看的，避免下一步漂出范围。
+**Verbally confirm the scope once**, for example: "Detected 2 staged files. This analysis only covers the staging area and will ignore unstaged changes and untracked files." This sentence is for your own guardrail, to avoid drifting out of scope in the next step.
 
-### Step 2 — 拿到作用域内的 diff
+### Step 2 - Get the Diff Within Scope
 
 ```bash
-git diff --cached   # 有暂存
-# 或
-git diff            # 无暂存
+git diff --cached   # staged changes exist
+# or
+git diff            # no staged changes
 ```
 
-**这是你写 analysis 的唯一信息源**。不要去 Read 文件全文，不要用你已有的关于这些文件的记忆——只看这条命令的输出。
+**This is the only information source for writing the analysis**. Do not read the full files. Do not use any existing memory you have about these files. Only inspect the output of this command.
 
-按"意图"而非"文件"组织思考——一个意图可能跨多个文件，一个文件也可能包含多个意图。
+Organize your thinking by "intent", not by "file": one intent may span multiple files, and one file may contain multiple intents.
 
-### Step 3 — 写分析 JSON
+### Step 3 - Write the Analysis JSON
 
-写到 `<repo>/tmp/git-diff-analysis.json`，schema：
+Write it to `<repo>/tmp/git-diff-analysis.json`, using this schema:
 
 ```json
 {
-  "title": "用作页面标题的短标题，10-25 字，能让人一眼知道这次改动在做什么",
-  "summary": "一两句话概括这次改动整体在做什么，作为正文导语",
-  "commit_subject": "必填：conventional commit 风格的单行 subject，例如 'feat(auth): add OAuth login'",
-  "commit_body": "必填：commit message 正文。可多段（用空行分隔），描述动机/影响/注意事项。若改动极简、subject 已说清，可以是空字符串。",
+  "title": "A short title used as the page title, 10-25 characters, that lets the reader understand at a glance what this change does",
+  "summary": "One or two sentences summarizing the overall purpose of this change, used as the body introduction",
+  "commit_subject": "Required: a one-line subject in conventional commit style, for example 'feat(auth): add OAuth login'",
+  "commit_body": "Required: the commit message body. It may contain multiple paragraphs separated by blank lines and should describe motivation, impact, and notes. If the change is extremely simple and the subject says enough, this may be an empty string.",
   "intents": [
     {
-      "title": "意图标题，动词开头，例如：添加 XX 功能 / 重构 YY / 修复 ZZ bug",
-      "files": ["相关文件路径1", "相关文件路径2"],
+      "title": "Intent title, starting with a verb, for example: Add XX feature / Refactor YY / Fix ZZ bug",
+      "files": ["related/file/path1", "related/file/path2"],
       "details": [
-        "要点 1：具体做了什么。可以写 1-3 句，提到关键函数名、参数变化、行为差异。",
-        "要点 2：另一处关联改动。对于长代码块，请尽量具体——比如『新增 X 函数处理 Y，落在 Z 模块的 N 行附近』。"
+        "Point 1: What was specifically changed. This may be 1-3 sentences and can mention key function names, parameter changes, and behavior differences.",
+        "Point 2: Another related change. For long code blocks, be as specific as possible, for example: 'Added function X to handle Y, located around line N of module Z.'"
       ],
-      "deep": "可选。当改动复杂或代码较长时填写。这里写默认折叠的长文：设计权衡（为什么选这个方案，否决了什么）、下游影响（哪些调用方/测试需要联动）、未来扩展点、值得读者花时间消化的实现细节。可以多段。"
+      "deep": "Optional. Fill this in when the change is complex or the code is long. Put the long-form analysis here; it is collapsed by default: design tradeoffs (why this approach was chosen and what was rejected), downstream impact (which callers/tests need to change together), future extension points, and implementation details worth the reader's time. It may contain multiple paragraphs."
     }
   ],
   "risks": [
-    "可选：删除了某函数但调用方未更新 / 留了 TODO / 行为变化可能影响其他模块"
+    "Optional: a function was deleted but callers were not updated / a TODO was left behind / a behavior change may affect other modules"
   ]
 }
 ```
 
-字段约束：
+Field constraints:
 
-- `title` 必填，做页面 `<title>` 和 `<h1>`，要有概括性，避免"修改了几个文件"这种空话。
-- `summary` 必填，1-2 句导语，比 title 详细一点。
-- `intents` 至少 1 项，按重要性排序，title 简洁有动词。
-- `details` 每个意图 **2-5 条**，**每条 1-3 句**——比纯短语要充实，能让读者光看右栏就能理解这块改动；遇到长函数 / 复杂逻辑就写得更具体（提函数名、关键参数、行为变化）。
-- `deep` 可选。**当改动复杂或代码较长时强烈建议填**。这里放设计权衡、下游影响、扩展性考虑等较长的内容，默认折叠不打扰扫读。
-- `risks` 可选；没有就省略字段或给空数组。**只列真正值得用户二次确认的东西**——不要凑数。
-- `commit_subject` / `commit_body` **必填**：HTML 顶部会渲染一个可编辑的提交面板和两个按钮（"复制 commit"、"复制 commit & push"），点击把对应 `git commit -m "..."` 命令复制到剪贴板。
-  - **工作区模式**（无暂存内容）下，复制的命令会**自动前置 `git add -A &&`**，把所有改动和未跟踪文件先暂存再 commit，匹配 HTML 展示的作用域；**暂存模式**下不加 `add`，只 commit 已暂存内容。
-  - `commit_subject` 必填、单行、非空（禁止换行、不能全空白，**违反会触发校验失败**），≤72 字，conventional commit 风格（`type(scope): summary`）。
-  - `commit_body` 必填字符串、可多段（用空行分隔段落）描述动机、影响、需要 reviewer 注意的点。**字段必须存在**，但允许为空字符串 `""`（仅当改动极简、subject 已说清时）。
+- `title` is required. It becomes the page `<title>` and `<h1>`. It must be summarizing and avoid empty phrases like "changed several files".
+- `summary` is required: a 1-2 sentence introduction, slightly more detailed than the title.
+- `intents` must contain at least 1 item, sorted by importance, with concise titles that use verbs.
+- `details` must contain **2-5 items** per intent, with **1-3 sentences per item**. Each item should be more substantial than a short phrase, so the reader can understand this part of the change from the right column alone. For long functions or complex logic, be more specific by naming functions, key parameters, and behavior changes.
+- `deep` is optional. **Strongly prefer filling it in when the change is complex or the code is long**. Put longer content here, such as design tradeoffs, downstream impact, and extensibility considerations. It is collapsed by default so it does not disturb scanning.
+- `risks` is optional. If there are no risks, omit the field or use an empty array. **Only list things genuinely worth a second confirmation from the user**; do not pad the list.
+- `commit_subject` / `commit_body` are **required**: the top of the HTML renders an editable commit panel and two buttons ("copy commit", "copy commit & push"). Clicking them copies the corresponding `git commit -m "..."` command to the clipboard.
+  - In **working-tree mode** (no staged changes), the copied command is **automatically prefixed with `git add -A &&`**, staging all changes and untracked files before committing, matching the scope shown by the HTML. In **staging-area mode**, no `add` is included; it only commits already staged content.
+  - `commit_subject` is required, single-line, non-empty (no newlines, not all whitespace; **violations trigger validation failure**), <=72 characters, and in conventional commit style (`type(scope): summary`).
+  - `commit_body` is a required string. It may contain multiple paragraphs separated by blank lines, describing motivation, impact, and points reviewers should pay attention to. **The field must exist**, but it may be the empty string `""` (only when the change is extremely simple and the subject says enough).
 
-### 渲染规则（影响你怎么组织 intents）
+### Rendering Rules (these affect how you organize intents)
 
-- 页面**按文件分行**，每行左侧是这个文件的 diff（带语法高亮），右侧是涉及这个文件的所有 intent 卡片。
-- 默认显示：意图标题 + details 列表。点击"展开深入分析"才显示 `deep` 长文——所以**`deep` 可以写长，不会污染默认视图**。
-- 一个 intent 的 `files` 列了多个文件时，这个 intent 会在每个相关文件的右栏**都出现一次**（带"跨文件"提示），不用担心遗漏，也不用为了让某文件不"空"而硬塞。
-- 一个文件如果在所有 intents 的 `files` 里都没出现，右栏会显示"该文件无关联意图分析"。**`files` 应覆盖所有改动文件**（包括二进制和工作区模式下的未跟踪新文件——见下）。
+- The page is arranged **one row per file**. The left side of each row shows that file's diff with syntax highlighting; the right side shows all intent cards related to that file.
+- By default, the page shows the intent title plus the `details` list. The `deep` long-form text only appears after clicking "expand deep analysis", so **`deep` can be long without polluting the default view**.
+- When an intent's `files` lists multiple files, that intent appears **once in the right column of every related file** with a "cross-file" hint. Do not worry about omissions, and do not force filler into a file just to keep it from looking "empty".
+- If a file does not appear in the `files` list of any intent, the right column will show "no associated intent analysis for this file". **`files` should cover all changed files**, including binary files and untracked new files in working-tree mode; see below.
 
-### 二进制文件 / 资源文件
+### Binary Files / Asset Files
 
-- 脚本会用 `git diff --numstat` 列出所有改动文件，**包括二进制**。二进制行的左栏自动显示"二进制文件，diff 内容不展示"占位符。
-- 二进制文件依然可以被 intent 引用——你不需要看内容也能解释意义（"添加产品 logo 图片"、"更新示例数据库 dump" 等）。把它们的路径写进相应 intent 的 `files` 即可。
+- The script uses `git diff --numstat` to list all changed files, **including binary files**. For binary rows, the left column automatically shows a "binary file; diff content not displayed" placeholder.
+- Binary files can still be referenced by intents. You do not need to inspect their contents to explain their meaning ("add product logo image", "update example database dump", etc.). Just include their paths in the relevant intent's `files`.
 
-### 未跟踪的新文件（仅工作区模式）
+### Untracked New Files (working-tree mode only)
 
-- 工作区模式下，未跟踪的新文件会作为 **first-class 文件行**渲染：左栏显示文件内容（全部 `+` 行 + 语法高亮），文件名带"新文件 · 未跟踪"标记。
-- 文本文件最多读前 500 行，超出部分会显示截断提示。二进制（含 NUL 字节）走与现有二进制一致的占位符。
-- 这些文件路径会自动进入作用域。**写 intent.files 时可以像引用普通改动文件一样引用它们。**
-- 暂存模式下未跟踪文件依然被忽略——作用域规则不变。
+- In working-tree mode, untracked new files are rendered as **first-class file rows**: the left column shows the file contents, with every line as an added `+` line plus syntax highlighting, and the file name is marked "new file - untracked".
+- For text files, only the first 500 lines are read; anything beyond that shows a truncation notice. Binary files, including files containing NUL bytes, use the same placeholder as existing binary files.
+- These file paths automatically enter the scope. **When writing `intent.files`, reference them just like ordinary changed files.**
+- In staging-area mode, untracked files are still ignored; the scope rule does not change.
 
-### Step 4 — 生成 HTML
+### Step 4 - Generate HTML
 
 ```bash
 python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.json
 ```
 
-脚本会输出最终 HTML 路径到 stdout（默认 `<repo>/tmp/git-diff.html`）。
+The script prints the final HTML path to stdout (default: `<repo>/tmp/git-diff.html`).
 
-**如果 stderr 出现 `[analysis] validation errors:`**，说明 JSON 不符合 schema（类型错、缺字段、files 指向不在作用域里的路径等）。HTML 顶部会出现红色 banner 列出所有问题。**修正 JSON 后重跑**——不要把带校验错的 HTML 交付给用户。常见坑：
-- `files` 写成字符串而非数组
-- `details` 写成字符串而非数组
-- `files` 里的路径在当前作用域不存在（拼写错或漂出作用域）
+**If stderr contains `[analysis] validation errors:`**, the JSON does not conform to the schema (wrong type, missing field, `files` points to paths outside the current scope, etc.). A red banner at the top of the HTML will list all problems. **Fix the JSON and rerun the script**; do not deliver HTML with validation errors to the user. Common pitfalls:
+- `files` is written as a string instead of an array
+- `details` is written as a string instead of an array
+- A path in `files` does not exist in the current scope (typo or drifted out of scope)
 
-### Step 5 — 告诉用户
+### Step 5 - Tell the User
 
-把输出路径告诉用户，一句话即可。不要重复 HTML 里已经写的内容。
+Tell the user the output path in one sentence. Do not repeat content already written in the HTML.
 
-## 命令参考
+## Command Reference
 
 ```bash
-# 只跑脚本，生成不带 AI 分析的 HTML（降级用法）
+# Run only the script, generating HTML without AI analysis (fallback usage)
 python skills/git-diff-visualizer/visualize.py
 
-# 带分析
+# With analysis
 python skills/git-diff-visualizer/visualize.py --analysis tmp/git-diff-analysis.json
 
-# 指定输出路径
+# Specify output path
 python skills/git-diff-visualizer/visualize.py --output some/path.html
 ```
 
-## 注意
+## Notes
 
-- HTML 文件固定名 `tmp/git-diff.html`，每次覆盖。不保留历史。
-- 脚本会自动 `mkdir -p tmp/`。
-- 项目根由 `git rev-parse --show-toplevel` 决定，所以在任何子目录运行都没问题。
-- 二进制文件 / 大文件改动：脚本不会特殊处理，但 git diff 本身就会跳过二进制内容，所以表现正常。
+- The HTML file has a fixed name: `tmp/git-diff.html`. It is overwritten every time. History is not preserved.
+- The script automatically runs the equivalent of `mkdir -p tmp/`.
+- The project root is determined by `git rev-parse --show-toplevel`, so running from any subdirectory is fine.
+- Binary file / large file changes: the script does not add special handling, but git diff itself skips binary content, so the behavior is normal.
